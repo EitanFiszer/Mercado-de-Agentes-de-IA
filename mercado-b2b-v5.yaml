@@ -5,9 +5,10 @@ info:
     API RESTful para un mercado inteligente B2B. Los usuarios publican requerimientos en texto libre (barrera de entrada cero).
     La plataforma procesa el texto, identifica variables faltantes y genera preguntas opcionales.
     Una vez publicada, los agentes registran su interés. El usuario elige con quiénes hablar.
-    Las ofertas se rankean por score compuesto. Una vez aceptada una oferta, la plataforma
-    gestiona el ciclo completo: pago con comprobante, producción, envío, entrega y disputes con moderador.
-  version: 4.0.0
+    Las ofertas se rankean por precio y calidad declarada. Una vez aceptada una oferta, la plataforma
+    gestiona el ciclo de fulfillment con pasos opcionales según el tipo de entregable
+    (físico, digital, servicio). El usuario aprueba al finalizar y califica al agente con 1-5 estrellas.
+  version: 5.0.0
 servers:
   - url: https://api.tu-mercado.com/v1
     description: Entorno de Producción
@@ -116,7 +117,7 @@ paths:
     post:
       tags:
         - Órdenes
-      summary: 3. Publicar (el usuario decide cuándo está listo)
+      summary: 3. Publicar
       description: >
         Pasa a PUBLISHED y dispara el webhook onNewOrderPublished a todos los agentes registrados.
       parameters:
@@ -157,7 +158,7 @@ paths:
       summary: Cerrar recepción de propuestas manualmente
       description: >
         Detiene nuevas expresiones de interés y bloquea nuevas ofertas.
-        No acepta ninguna oferta todavía — para eso usar POST /offers/{offerId}/accept.
+        No aprueba ninguna oferta — para eso usar POST /offers/{offerId}/approve.
       parameters:
         - name: orderId
           in: path
@@ -183,7 +184,6 @@ paths:
       description: >
         Después de recibir el webhook onNewOrderPublished, el agente puede registrar
         su interés. Esto NO abre un chat — solo lo agrega a la lista visible al usuario.
-        El agente puede incluir un opener de hasta 280 caracteres.
       parameters:
         - name: orderId
           in: path
@@ -270,8 +270,8 @@ paths:
         - Interés de Agentes
       summary: El usuario invita a un agente a chatear
       description: >
-        El usuario elige un agente de la lista y lo invita.
-        Crea la Conversacion y dispara el webhook onAgentNotification con type INVITED al agente.
+        Crea la Conversacion y dispara onAgentNotification(INVITED) al agente.
+        Solo el usuario puede iniciar conversaciones.
       parameters:
         - name: orderId
           in: path
@@ -285,7 +285,7 @@ paths:
             type: string
       responses:
         '201':
-          description: Conversación creada. Webhook disparado al agente.
+          description: Conversación creada. Agente notificado.
           content:
             application/json:
               schema:
@@ -376,13 +376,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Mensaje'
-              example:
-                messageId: "msg_001"
-                conversationId: "conv_789"
-                senderType: "AGENT"
-                senderId: "agt_01"
-                content: "¿Las sillas son para interior, exterior o ambos ambientes?"
-                timestamp: "2026-01-10T16:05:00Z"
 
   # ------------------------------------------
   # 4. OFERTAS
@@ -393,15 +386,15 @@ paths:
         - Ofertas
       summary: El agente formaliza su propuesta
       description: >
-        El precio no puede superar el budget de la orden (HTTP 422 si lo supera).
-        offeredQuality y price alimentan el score compuesto de ranking.
+        El precio no puede superar el budget de la orden si está seteado (HTTP 422).
+        El agente declara qué pasos de fulfillment aplican a su entregable.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [orderId, agentId, price, offeredQuality, pitch]
+              required: [orderId, agentId, price, offeredQuality, pitch, fulfillmentSteps]
               properties:
                 orderId:
                   type: string
@@ -409,20 +402,33 @@ paths:
                   type: string
                 price:
                   type: number
+                  description: Precio total propuesto en USD.
                 offeredQuality:
                   type: string
                   enum: [ECONOMY, STANDARD, PREMIUM]
                 pitch:
                   type: string
+                fulfillmentSteps:
+                  type: array
+                  description: >
+                    Pasos que el agente declara que aplican a esta entrega.
+                    IN_PROGRESS siempre está incluido.
+                    SHIPMENT aplica a entregables físicos o digitales con link.
+                    El usuario aprueba siempre al final con APPROVED.
+                  items:
+                    type: string
+                    enum: [IN_PROGRESS, SHIPMENT, APPROVED]
+                  example: [IN_PROGRESS, SHIPMENT, APPROVED]
             example:
               orderId: "ord_123"
               agentId: "agt_01"
               price: 7200.00
               offeredQuality: "PREMIUM"
               pitch: "Sillas de polipropileno reforzado para gastronomía. Entrega en 20 días hábiles con garantía de 2 años."
+              fulfillmentSteps: [IN_PROGRESS, SHIPMENT, APPROVED]
       responses:
         '201':
-          description: Oferta registrada. Score calculado automáticamente.
+          description: Oferta registrada.
           content:
             application/json:
               schema:
@@ -434,9 +440,8 @@ paths:
                 price: 7200.00
                 offeredQuality: "PREMIUM"
                 pitch: "Sillas de polipropileno reforzado para gastronomía. Entrega en 20 días hábiles con garantía de 2 años."
-                score: 0.87
+                fulfillmentSteps: [IN_PROGRESS, SHIPMENT, APPROVED]
                 fulfillmentStatus: null
-                fulfillmentNotes: []
                 status: "PENDING"
         '422':
           description: El precio supera el budget declarado.
@@ -449,7 +454,7 @@ paths:
                 code: 422
                 message: "El precio propuesto ($9,500) supera el budget de la orden ($8,000)."
         '403':
-          description: La orden no está en estado PUBLISHED o el agente no fue invitado.
+          description: La orden no está en PUBLISHED o el agente no fue invitado.
           content:
             application/json:
               schema:
@@ -459,11 +464,10 @@ paths:
     get:
       tags:
         - Ofertas
-      summary: El usuario ve las ofertas rankeadas
+      summary: El usuario ve las ofertas
       description: >
-        Rankeadas por score compuesto. Fórmula: score = (1 - precio_norm) * peso_precio + quality_match * peso_calidad.
-        Pesos según quality pedida: ECONOMY (0.9/0.1), STANDARD (0.5/0.5), PREMIUM (0.2/0.8).
-        Si quality es null, score = 1 - precio_norm.
+        Ordenadas por precio por defecto. Si quality está seteada en la orden,
+        se puede ordenar también por quality match.
       parameters:
         - name: orderId
           in: path
@@ -474,17 +478,17 @@ paths:
           in: query
           schema:
             type: string
-            enum: [score, price, quality]
-            default: score
+            enum: [price, quality]
+            default: price
         - name: order
           in: query
           schema:
             type: string
             enum: [asc, desc]
-            default: desc
+            default: asc
       responses:
         '200':
-          description: Lista rankeada de ofertas.
+          description: Lista de ofertas.
           content:
             application/json:
               schema:
@@ -498,9 +502,8 @@ paths:
                   price: 7200.00
                   offeredQuality: "PREMIUM"
                   pitch: "Sillas de polipropileno reforzado para gastronomía. Entrega en 20 días hábiles con garantía de 2 años."
-                  score: 0.87
+                  fulfillmentSteps: [IN_PROGRESS, SHIPMENT, APPROVED]
                   fulfillmentStatus: null
-                  fulfillmentNotes: []
                   status: "PENDING"
                 - offerId: "off_322"
                   orderId: "ord_123"
@@ -508,9 +511,8 @@ paths:
                   price: 6100.00
                   offeredQuality: "STANDARD"
                   pitch: "Sillas de acero inoxidable con tapizado vinílico. Stock inmediato, entrega en 5 días hábiles."
-                  score: 0.61
+                  fulfillmentSteps: [IN_PROGRESS, SHIPMENT, APPROVED]
                   fulfillmentStatus: null
-                  fulfillmentNotes: []
                   status: "PENDING"
 
   /offers/{offerId}/accept:
@@ -519,10 +521,10 @@ paths:
         - Ofertas
       summary: El usuario acepta una oferta
       description: >
-        La oferta pasa a ACCEPTED y su fulfillmentStatus arranca en PENDING_PAYMENT.
-        La plataforma dispara onAgentNotification(OFFER_ACCEPTED) al agente ganador
-        y onAgentNotification(OFFER_REJECTED) a los demás.
+        La oferta pasa a ACCEPTED y su fulfillmentStatus arranca en IN_PROGRESS.
         La orden pasa a CLOSED.
+        Se dispara onAgentNotification(OFFER_ACCEPTED) al agente ganador
+        y onAgentNotification(OFFER_REJECTED) a los demás.
       parameters:
         - name: offerId
           in: path
@@ -531,7 +533,7 @@ paths:
             type: string
       responses:
         '200':
-          description: Oferta aceptada. Ciclo de fulfillment iniciado.
+          description: Oferta aceptada. Fulfillment iniciado.
           content:
             application/json:
               schema:
@@ -542,133 +544,23 @@ paths:
                 agentId: "agt_01"
                 price: 7200.00
                 offeredQuality: "PREMIUM"
-                pitch: "Sillas de polipropileno reforzado para gastronomía. Entrega en 20 días hábiles con garantía de 2 años."
-                score: 0.87
-                fulfillmentStatus: "PENDING_PAYMENT"
-                fulfillmentNotes: []
+                fulfillmentSteps: [IN_PROGRESS, SHIPMENT, APPROVED]
+                fulfillmentStatus: "IN_PROGRESS"
                 status: "ACCEPTED"
 
   # ------------------------------------------
-  # 5. FULFILLMENT (ciclo post-aceptación)
+  # 5. FULFILLMENT
   # ------------------------------------------
-  /offers/{offerId}/payment:
+  /offers/{offerId}/shipment:
     post:
       tags:
         - Fulfillment
-      summary: El usuario sube el comprobante de pago
+      summary: El agente registra el envío o entrega el entregable
       description: >
-        El usuario adjunta el comprobante. La plataforma lo reenvía al agente
-        vía onAgentNotification(PAYMENT_SUBMITTED) para que lo valide.
-        El fulfillmentStatus pasa a PAYMENT_UNDER_REVIEW.
-        Si el agente rechaza, vuelve a PENDING_PAYMENT (máx. 3 intentos).
-        Al tercer rechazo consecutivo, escala automáticamente a DISPUTED.
-      parameters:
-        - name: offerId
-          in: path
-          required: true
-          schema:
-            type: string
-      requestBody:
-        required: true
-        content:
-          multipart/form-data:
-            schema:
-              type: object
-              required: [userId, receiptFile]
-              properties:
-                userId:
-                  type: string
-                receiptFile:
-                  type: string
-                  format: binary
-                  description: Imagen o PDF del comprobante de transferencia.
-                notes:
-                  type: string
-                  description: Nota opcional del usuario (ej. "transferí desde banco X").
-            example:
-              userId: "usr_999"
-              notes: "Transferí desde Banco Nación, ref 4892-XX."
-      responses:
-        '200':
-          description: Comprobante recibido. Agente notificado para validar.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Oferta'
-              example:
-                offerId: "off_321"
-                fulfillmentStatus: "PAYMENT_UNDER_REVIEW"
-                paymentAttempts: 1
-                fulfillmentNotes: []
-                status: "ACCEPTED"
-        '422':
-          description: La oferta no está en estado PENDING_PAYMENT.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-  /offers/{offerId}/payment/validate:
-    post:
-      tags:
-        - Fulfillment
-      summary: El agente valida o rechaza el comprobante
-      description: >
-        Si aprueba: fulfillmentStatus → PAID. Se notifica al usuario.
-        Si rechaza: fulfillmentStatus → PAYMENT_REJECTED → PENDING_PAYMENT (si quedan intentos)
-        o → DISPUTED (si ya se agotaron los 3 intentos).
-      parameters:
-        - name: offerId
-          in: path
-          required: true
-          schema:
-            type: string
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [agentId, approved]
-              properties:
-                agentId:
-                  type: string
-                approved:
-                  type: boolean
-                rejectionReason:
-                  type: string
-                  description: Obligatorio si approved es false.
-            example:
-              agentId: "agt_01"
-              approved: true
-      responses:
-        '200':
-          description: Validación procesada.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Oferta'
-              example:
-                offerId: "off_321"
-                fulfillmentStatus: "PAID"
-                paymentAttempts: 1
-                fulfillmentNotes: []
-                status: "ACCEPTED"
-        '422':
-          description: La oferta no está en PAYMENT_UNDER_REVIEW.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-  /offers/{offerId}/production:
-    post:
-      tags:
-        - Fulfillment
-      summary: El agente marca que arrancó la producción/preparación
-      description: >
-        Solo disponible cuando fulfillmentStatus es PAID.
-        Pasa a IN_PRODUCTION y notifica al usuario.
+        Aplica solo si SHIPMENT está en los fulfillmentSteps de la oferta.
+        Para entregables físicos el agente carga número de tracking.
+        Para entregables digitales (ej. una web) carga la URL de entrega.
+        Pasa a SHIPPED y notifica al usuario.
       parameters:
         - name: offerId
           in: path
@@ -685,66 +577,25 @@ paths:
               properties:
                 agentId:
                   type: string
-                estimatedShipDate:
-                  type: string
-                  format: date
-                  description: Fecha estimada de despacho (opcional).
-            example:
-              agentId: "agt_01"
-              estimatedShipDate: "2026-02-28"
-      responses:
-        '200':
-          description: Producción iniciada. Usuario notificado.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Oferta'
-              example:
-                offerId: "off_321"
-                fulfillmentStatus: "IN_PRODUCTION"
-                fulfillmentNotes: []
-                status: "ACCEPTED"
-
-  /offers/{offerId}/shipment:
-    post:
-      tags:
-        - Fulfillment
-      summary: El agente registra el envío con número de tracking
-      description: >
-        Solo disponible cuando fulfillmentStatus es IN_PRODUCTION.
-        Pasa a SHIPPED y notifica al usuario con el tracking.
-      parameters:
-        - name: offerId
-          in: path
-          required: true
-          schema:
-            type: string
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [agentId, trackingNumber, carrier]
-              properties:
-                agentId:
-                  type: string
                 trackingNumber:
                   type: string
+                  description: Para entregables físicos.
                 carrier:
                   type: string
-                  description: Nombre del transportista.
-                estimatedDeliveryDate:
+                  description: Para entregables físicos.
+                deliveryUrl:
                   type: string
-                  format: date
+                  format: uri
+                  description: Para entregables digitales (web, archivo, etc).
+                notes:
+                  type: string
             example:
               agentId: "agt_01"
               trackingNumber: "OCA-2026-88421"
               carrier: "OCA"
-              estimatedDeliveryDate: "2026-03-10"
       responses:
         '200':
-          description: Envío registrado. Usuario notificado con tracking.
+          description: Envío/entrega registrada. Usuario notificado.
           content:
             application/json:
               schema:
@@ -754,21 +605,27 @@ paths:
                 fulfillmentStatus: "SHIPPED"
                 trackingNumber: "OCA-2026-88421"
                 carrier: "OCA"
-                estimatedDeliveryDate: "2026-03-10"
-                fulfillmentNotes: []
+                deliveryUrl: null
                 status: "ACCEPTED"
+        '422':
+          description: SHIPMENT no está en los fulfillmentSteps de esta oferta, o el estado actual no lo permite.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
-  /offers/{offerId}/delivery:
+  /offers/{offerId}/approve:
     post:
       tags:
         - Fulfillment
-      summary: El usuario confirma la entrega
+      summary: El usuario aprueba la oferta como completada
       description: >
-        El usuario confirma que recibió el pedido. Puede marcar si llegó tarde
-        o si hubo problemas parciales — esto queda anotado en fulfillmentNotes
-        pero NO abre una disputa automáticamente.
-        Si todo está bien, fulfillmentStatus → COMPLETED.
-        Si quiere abrir una disputa, usar POST /offers/{offerId}/dispute.
+        El usuario confirma que el trabajo está hecho. Puede aprobar en cualquier momento
+        del fulfillment — no es necesario haber pasado por SHIPMENT si no aplica.
+        El fulfillmentStatus pasa a APPROVED.
+        El usuario califica al agente con 1 a 5 estrellas — esta calificación se promedia
+        con las anteriores para actualizar el score del agente.
+        Aprobar no cierra la posibilidad de abrir una disputa luego si surge algún problema.
       parameters:
         - name: offerId
           in: path
@@ -781,33 +638,25 @@ paths:
           application/json:
             schema:
               type: object
-              required: [userId, received]
+              required: [userId, rating]
               properties:
                 userId:
                   type: string
-                received:
-                  type: boolean
-                  description: true si el pedido llegó (aunque sea con observaciones).
-                notes:
-                  type: array
-                  description: >
-                    Anotaciones opcionales sobre la entrega. Se guardan en fulfillmentNotes
-                    y afectan el score del agente pero no bloquean el flujo.
-                  items:
-                    type: string
-                    enum:
-                      - DELIVERED_LATE
-                      - PARTIAL_DELIVERY
-                      - PACKAGING_DAMAGED
-                      - QUALITY_BELOW_EXPECTED
+                rating:
+                  type: integer
+                  minimum: 1
+                  maximum: 5
+                  description: Calificación del agente de 1 a 5 estrellas.
+                comment:
+                  type: string
+                  description: Comentario opcional sobre la experiencia.
             example:
               userId: "usr_999"
-              received: true
-              notes:
-                - "DELIVERED_LATE"
+              rating: 4
+              comment: "Excelente calidad, llegaron un poco tarde pero el producto superó las expectativas."
       responses:
         '200':
-          description: Entrega confirmada. fulfillmentStatus → COMPLETED.
+          description: Oferta aprobada. Score del agente actualizado.
           content:
             application/json:
               schema:
@@ -818,13 +667,10 @@ paths:
                 agentId: "agt_01"
                 price: 7200.00
                 offeredQuality: "PREMIUM"
-                pitch: "Sillas de polipropileno reforzado para gastronomía. Entrega en 20 días hábiles con garantía de 2 años."
-                score: 0.87
-                fulfillmentStatus: "COMPLETED"
-                trackingNumber: "OCA-2026-88421"
-                carrier: "OCA"
-                fulfillmentNotes:
-                  - "DELIVERED_LATE"
+                fulfillmentSteps: [IN_PROGRESS, SHIPMENT, APPROVED]
+                fulfillmentStatus: "APPROVED"
+                rating: 4
+                comment: "Excelente calidad, llegaron un poco tarde pero el producto superó las expectativas."
                 status: "ACCEPTED"
 
   # ------------------------------------------
@@ -836,9 +682,9 @@ paths:
         - Disputas
       summary: Abrir una disputa
       description: >
-        Cualquiera de las dos partes puede abrir una disputa.
-        El fulfillmentStatus pasa a DISPUTED y se bloquea el flujo hasta resolución.
-        Ambas partes pueden subir evidencias vía POST /offers/{offerId}/dispute/evidence.
+        Cualquiera de las dos partes puede abrir una disputa en cualquier momento
+        del fulfillment, incluso después de que el usuario haya aprobado.
+        El fulfillmentStatus pasa a DISPUTED y se bloquea hasta resolución del moderador.
       parameters:
         - name: offerId
           in: path
@@ -860,7 +706,6 @@ paths:
                   type: string
                 reason:
                   type: string
-                  description: Descripción libre del motivo de la disputa.
             example:
               initiatorType: "USER"
               initiatorId: "usr_999"
@@ -887,10 +732,8 @@ paths:
     post:
       tags:
         - Disputas
-      summary: Subir evidencia a la disputa
-      description: >
-        Usuario o agente pueden subir archivos de evidencia (fotos, documentos, capturas).
-        Ambas partes pueden subir múltiples evidencias hasta que el moderador resuelva.
+      summary: Subir evidencia
+      description: Usuario o agente pueden subir archivos de evidencia (fotos, documentos, capturas).
       parameters:
         - name: offerId
           in: path
@@ -915,7 +758,6 @@ paths:
                   format: binary
                 description:
                   type: string
-                  description: Descripción breve de la evidencia.
             example:
               submitterType: "USER"
               submitterId: "usr_999"
@@ -944,9 +786,8 @@ paths:
       description: >
         Solo ejecutable por un moderador de la plataforma.
         La resolución puede ser a favor de una parte o parcial.
-        Las anotaciones parciales (ej. PARTIAL_DELIVERY_CONFIRMED) se agregan
-        a fulfillmentNotes de la oferta y afectan el score del agente.
         El fulfillmentStatus pasa a RESOLVED.
+        Si la decisión es USER_FAVOR o PARTIAL, impacta negativamente en el score del agente.
       parameters:
         - name: offerId
           in: path
@@ -966,34 +807,25 @@ paths:
                 decision:
                   type: string
                   enum: [USER_FAVOR, AGENT_FAVOR, PARTIAL]
-                  description: >
-                    USER_FAVOR: el agente incumplió, impacto negativo en su score.
-                    AGENT_FAVOR: el reclamo del usuario no procedió.
-                    PARTIAL: hubo incumplimiento parcial — se anotan los flags en fulfillmentNotes.
                 summary:
                   type: string
-                  description: Explicación de la resolución visible para ambas partes.
-                fulfillmentFlags:
-                  type: array
+                  description: Explicación visible para ambas partes.
+                agentScorePenalty:
+                  type: number
+                  minimum: 0
+                  maximum: 5
                   description: >
-                    Obligatorio si decision es PARTIAL. Flags que se agregan a fulfillmentNotes
-                    de la oferta y se usan para calcular el score del agente.
-                  items:
-                    type: string
-                    enum:
-                      - PARTIAL_DELIVERY_CONFIRMED
-                      - DELIVERED_LATE_CONFIRMED
-                      - QUALITY_BELOW_EXPECTED_CONFIRMED
-                      - PACKAGING_DAMAGED_CONFIRMED
+                    Solo si decision es USER_FAVOR o PARTIAL.
+                    El moderador indica cuánto penalizar el score del agente (0–5).
+                    Se resta del promedio actual del agente.
             example:
               moderatorId: "mod_001"
               decision: "PARTIAL"
-              summary: "El agente entregó 450 de 500 sillas. Se confirma entrega parcial. El agente deberá entregar las 50 unidades restantes o acordar una devolución proporcional con el usuario."
-              fulfillmentFlags:
-                - "PARTIAL_DELIVERY_CONFIRMED"
+              summary: "El agente entregó 450 de 500 sillas. Se confirma entrega parcial."
+              agentScorePenalty: 1.0
       responses:
         '200':
-          description: Disputa resuelta. fulfillmentNotes actualizadas. Score del agente recalculado.
+          description: Disputa resuelta. Score del agente actualizado si aplica.
           content:
             application/json:
               schema:
@@ -1013,13 +845,12 @@ paths:
                 resolution:
                   decision: "PARTIAL"
                   summary: "El agente entregó 450 de 500 sillas. Se confirma entrega parcial."
-                  fulfillmentFlags:
-                    - "PARTIAL_DELIVERY_CONFIRMED"
+                  agentScorePenalty: 1.0
                   resolvedAt: "2026-03-14T09:00:00Z"
                 createdAt: "2026-03-12T10:00:00Z"
 
 # ==========================================
-# WEBHOOKS — un solo endpoint por agente
+# WEBHOOKS
 # ==========================================
 webhooks:
 
@@ -1059,11 +890,10 @@ webhooks:
         El campo type indica qué pasó; el agente ramifica internamente.
         Tipos posibles:
           INVITED — el usuario lo invitó a chatear.
-          CONVERSATION_UPDATED — el usuario respondió (o el turno expiró).
-          OFFER_ACCEPTED — su oferta fue aceptada.
+          CONVERSATION_UPDATED — el usuario respondió (o el turno expiró, userReplied=false).
+          OFFER_ACCEPTED — su oferta fue aceptada, fulfillment arranca.
           OFFER_REJECTED — su oferta no fue seleccionada.
-          PAYMENT_SUBMITTED — el usuario subió un comprobante para validar.
-          FULFILLMENT_UPDATED — cambio de estado en el fulfillment (PAID, IN_PRODUCTION, SHIPPED, etc).
+          FULFILLMENT_UPDATED — cambio de estado (IN_PROGRESS, SHIPPED, APPROVED).
           DISPUTE_OPENED — se abrió una disputa sobre su oferta.
           DISPUTE_RESOLVED — el moderador resolvió la disputa.
       requestBody:
@@ -1073,7 +903,7 @@ webhooks:
               $ref: '#/components/schemas/AgentNotification'
             examples:
               invited:
-                summary: El usuario invitó al agente a chatear
+                summary: El usuario invitó al agente
                 value:
                   type: "INVITED"
                   agentId: "agt_01"
@@ -1085,34 +915,8 @@ webhooks:
                       budget: 8000.00
                       quality: "PREMIUM"
                       technicalSpecification: "500 sillas para restaurantes. Calidad PREMIUM. Presupuesto: $8,000 USD."
-              payment_submitted:
-                summary: El usuario subió el comprobante
-                value:
-                  type: "PAYMENT_SUBMITTED"
-                  agentId: "agt_01"
-                  orderId: "ord_123"
-                  offerId: "off_321"
-                  payload:
-                    paymentAttempts: 1
-                    receiptUrl: "https://storage.tu-mercado.com/receipts/off_321_attempt1.pdf"
-                    notes: "Transferí desde Banco Nación, ref 4892-XX."
-              conversation_updated:
-                summary: El usuario respondió en el chat
-                value:
-                  type: "CONVERSATION_UPDATED"
-                  agentId: "agt_01"
-                  orderId: "ord_123"
-                  conversationId: "conv_789"
-                  payload:
-                    userReplied: true
-                    messages:
-                      - messageId: "msg_002"
-                        senderType: "USER"
-                        senderId: "usr_999"
-                        content: "Son para interior, pero necesito que sean fáciles de limpiar."
-                        timestamp: "2026-01-10T16:12:00Z"
               offer_accepted:
-                summary: La oferta del agente fue aceptada
+                summary: La oferta fue aceptada
                 value:
                   type: "OFFER_ACCEPTED"
                   agentId: "agt_01"
@@ -1121,9 +925,10 @@ webhooks:
                   payload:
                     price: 7200.00
                     offeredQuality: "PREMIUM"
-                    fulfillmentStatus: "PENDING_PAYMENT"
+                    fulfillmentStatus: "IN_PROGRESS"
+                    fulfillmentSteps: [IN_PROGRESS, SHIPMENT, APPROVED]
               offer_rejected:
-                summary: La oferta del agente no fue seleccionada
+                summary: La oferta no fue seleccionada
                 value:
                   type: "OFFER_REJECTED"
                   agentId: "agt_02"
@@ -1132,6 +937,17 @@ webhooks:
                   payload:
                     price: 6100.00
                     offeredQuality: "STANDARD"
+              fulfillment_approved:
+                summary: El usuario aprobó la oferta
+                value:
+                  type: "FULFILLMENT_UPDATED"
+                  agentId: "agt_01"
+                  orderId: "ord_123"
+                  offerId: "off_321"
+                  payload:
+                    fulfillmentStatus: "APPROVED"
+                    rating: 4
+                    comment: "Excelente calidad, llegaron un poco tarde pero el producto superó las expectativas."
               dispute_resolved:
                 summary: El moderador resolvió la disputa
                 value:
@@ -1142,8 +958,7 @@ webhooks:
                   payload:
                     decision: "PARTIAL"
                     summary: "El agente entregó 450 de 500 sillas. Se confirma entrega parcial."
-                    fulfillmentFlags:
-                      - "PARTIAL_DELIVERY_CONFIRMED"
+                    agentScorePenalty: 1.0
       responses:
         '200':
           description: El agente confirma recepción.
@@ -1177,14 +992,20 @@ components:
         agentWebhookUrl:
           type: string
           format: uri
-          description: >
-            URL donde la plataforma enviará onNewOrderPublished y onAgentNotification.
-        score:
+          description: URL donde la plataforma enviará onNewOrderPublished y onAgentNotification.
+        averageRating:
           type: number
           readOnly: true
+          minimum: 1
+          maximum: 5
           description: >
-            Score de reputación del agente (0–5), calculado a partir del historial
-            de fulfillmentNotes en sus ofertas completadas.
+            Promedio de todas las calificaciones recibidas (1–5 estrellas).
+            Se actualiza al aprobarse cada oferta y puede penalizarse por resoluciones
+            de disputas a favor del usuario.
+        totalRatings:
+          type: integer
+          readOnly: true
+          description: Cantidad de calificaciones que componen el promedio.
 
     Order:
       type: object
@@ -1290,68 +1111,49 @@ components:
           enum: [ECONOMY, STANDARD, PREMIUM]
         pitch:
           type: string
-        score:
-          type: number
-          readOnly: true
-          description: >
-            Score compuesto (0–1). Fórmula: (1 - precio_norm) * peso_precio + quality_match * peso_calidad.
-            Pesos: ECONOMY (0.9/0.1), STANDARD (0.5/0.5), PREMIUM (0.2/0.8). Null quality → solo precio.
+        fulfillmentSteps:
+          type: array
+          description: Pasos declarados por el agente al crear la oferta.
+          items:
+            type: string
+            enum: [IN_PROGRESS, SHIPMENT, APPROVED]
         fulfillmentStatus:
           type: string
           nullable: true
           enum:
-            - PENDING_PAYMENT
-            - PAYMENT_UNDER_REVIEW
-            - PAYMENT_REJECTED
-            - PAID
-            - IN_PRODUCTION
+            - IN_PROGRESS
             - SHIPPED
-            - DELIVERED
-            - COMPLETED
+            - APPROVED
             - DISPUTED
             - RESOLVED
           description: >
             Null hasta que la oferta es aceptada.
-            PENDING_PAYMENT → usuario debe subir comprobante.
-            PAYMENT_UNDER_REVIEW → agente validando comprobante.
-            PAYMENT_REJECTED → comprobante rechazado, usuario reintenta (máx. 3 veces).
-            PAID → pago confirmado por el agente.
-            IN_PRODUCTION → agente marcó inicio de producción/preparación.
-            SHIPPED → agente cargó tracking de envío.
-            DELIVERED → usuario confirmó recepción.
-            COMPLETED → ciclo cerrado sin disputas.
-            DISPUTED → disputa abierta, flujo bloqueado hasta resolución.
+            IN_PROGRESS → el agente está trabajando.
+            SHIPPED → entregable enviado o link provisto.
+            APPROVED → usuario aprobó y calificó.
+            DISPUTED → disputa abierta, flujo bloqueado.
             RESOLVED → moderador resolvió la disputa.
-        paymentAttempts:
-          type: integer
-          description: Cantidad de comprobantes subidos. Al llegar a 3 rechazos consecutivos, escala a DISPUTED.
-          default: 0
         trackingNumber:
           type: string
           nullable: true
         carrier:
           type: string
           nullable: true
-        estimatedDeliveryDate:
+        deliveryUrl:
           type: string
-          format: date
+          format: uri
           nullable: true
-        fulfillmentNotes:
-          type: array
-          description: >
-            Anotaciones sobre la calidad del cumplimiento. Se usan para calcular
-            el score de reputación del agente. No bloquean el flujo.
-          items:
-            type: string
-            enum:
-              - DELIVERED_LATE
-              - PARTIAL_DELIVERY
-              - PACKAGING_DAMAGED
-              - QUALITY_BELOW_EXPECTED
-              - PARTIAL_DELIVERY_CONFIRMED
-              - DELIVERED_LATE_CONFIRMED
-              - QUALITY_BELOW_EXPECTED_CONFIRMED
-              - PACKAGING_DAMAGED_CONFIRMED
+          description: URL del entregable digital (web, archivo, etc).
+        rating:
+          type: integer
+          nullable: true
+          minimum: 1
+          maximum: 5
+          description: Calificación dada por el usuario al aprobar (1–5 estrellas).
+        comment:
+          type: string
+          nullable: true
+          description: Comentario opcional del usuario al aprobar.
         status:
           type: string
           enum: [PENDING, ACCEPTED, REJECTED]
@@ -1386,10 +1188,9 @@ components:
               enum: [USER_FAVOR, AGENT_FAVOR, PARTIAL]
             summary:
               type: string
-            fulfillmentFlags:
-              type: array
-              items:
-                type: string
+            agentScorePenalty:
+              type: number
+              nullable: true
             resolvedAt:
               type: string
               format: date-time
@@ -1420,9 +1221,6 @@ components:
 
     AgentNotification:
       type: object
-      description: >
-        Payload unificado para el webhook onAgentNotification.
-        El campo type determina qué campos están presentes en payload.
       required: [type, agentId]
       properties:
         type:
@@ -1432,7 +1230,6 @@ components:
             - CONVERSATION_UPDATED
             - OFFER_ACCEPTED
             - OFFER_REJECTED
-            - PAYMENT_SUBMITTED
             - FULFILLMENT_UPDATED
             - DISPUTE_OPENED
             - DISPUTE_RESOLVED
